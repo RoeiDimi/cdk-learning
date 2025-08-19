@@ -1,0 +1,432 @@
+// Basic client-side chat app for serverless_chat_app
+// Assumptions based on backend:
+// - REST endpoints (same origin):
+//   POST /login            body: { username }  -> returns { token, messages: [...], wsUrl }
+//   POST /addMessages      body: { message }   -> requires Authorization token
+// - WebSocket: API Gateway URL provided as wsUrl by /login response. Token is passed as query param (?token=...).
+// - On login, server returns all stored messages. Afterwards, new messages arrive via WebSocket broadcasts.
+
+(() => {
+    // ---------- Simple DOM helpers ----------
+    const $ = (sel, root = document) => root.querySelector(sel);
+    const el = (tag, attrs = {}, ...children) => {
+        const node = document.createElement(tag);
+        Object.entries(attrs || {}).forEach(([k, v]) => {
+            if (k === 'class') node.className = v;
+            else if (k === 'style' && typeof v === 'object') Object.assign(node.style, v);
+            else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2), v);
+            else if (v !== undefined && v !== null) node.setAttribute(k, v);
+        });
+        children.flat().forEach(c => node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c));
+        return node;
+    };
+
+    // ---------- State ----------
+    const state = {
+        username: null,
+        token: null,
+        wsUrl: null,
+        ws: null,
+        wsBackoffMs: 500,
+        wsMaxBackoffMs: 15000,
+        connected: false,
+        messages: new Map(), // id -> message
+    };
+
+    // ---------- UI ----------
+    const app = el('div', { id: 'app', class: 'chat-app' });
+    const style = el('style', {}, `
+        * { box-sizing: border-box; font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+        body, html { margin: 0; padding: 0; height: 100%; background: #0f172a; color: #e2e8f0; }
+        .chat-app { display: grid; grid-template-rows: auto 1fr auto; height: 100vh; max-width: 900px; margin: 0 auto; }
+        header { padding: 12px 16px; background: #111827; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #1f2937; }
+        header .title { font-weight: 600; }
+        .status { font-size: 12px; opacity: .8; }
+        .container { display: grid; grid-template-rows: auto 1fr auto; height: calc(100vh - 110px); }
+        .login { padding: 16px; display: grid; gap: 12px; background: #0b1220; border-bottom: 1px solid #1f2937; }
+        .auth-tabs { display: flex; gap: 4px; }
+        .tab-btn { padding: 8px 16px; border-radius: 6px; border: 1px solid #334155; background: #0f172a; color: #94a3b8; cursor: pointer; font-size: 14px; }
+        .tab-btn.active { background: #1e293b; color: #e2e8f0; border-color: #475569; }
+        .auth-form { display: grid; gap: 8px; }
+        .auth-form label { font-size: 14px; color: #cbd5e1; margin-bottom: 4px; }
+        .auth-form input { padding: 10px 12px; border-radius: 8px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; }
+        .auth-form button { padding: 10px 12px; border-radius: 8px; border: none; background: #2563eb; color: white; cursor: pointer; font-weight: 500; }
+        .auth-form button:disabled { opacity: .6; cursor: not-allowed; }
+        .auth-form button:hover:not(:disabled) { background: #1d4ed8; }
+        .messages { padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+        .bubble { max-width: 75%; padding: 10px 12px; border-radius: 12px; background: #111827; border: 1px solid #1f2937; }
+        .me { align-self: flex-end; background: #1d4ed8; border-color: #1d4ed8; }
+        .meta { font-size: 11px; opacity: .75; margin-bottom: 4px; }
+        .text { white-space: pre-wrap; word-break: break-word; }
+        .composer { padding: 12px; display: grid; grid-template-columns: 1fr auto; gap: 8px; border-top: 1px solid #1f2937; background: #0b1220; }
+        .composer input { padding: 12px; border-radius: 10px; border: 1px solid #334155; background: #0f172a; color: #e2e8f0; }
+        .composer button { padding: 0 16px; border-radius: 10px; border: none; background: #22c55e; color: #052e16; font-weight: 600; cursor: pointer; }
+        .hint { font-size: 12px; opacity: .8; }
+        .hidden { display: none !important; }
+    `);
+
+    const header = el('header', {}, 
+        el('div', { class: 'title' }, 'Serverless Chat'),
+        el('div', { class: 'status', id: 'status' }, 'Disconnected')
+    );
+
+    const loginView = el('div', { class: 'login', id: 'login' },
+        el('div', { class: 'auth-tabs' },
+            el('button', { id: 'loginTab', class: 'tab-btn active' }, 'Login'),
+            el('button', { id: 'registerTab', class: 'tab-btn' }, 'Register')
+        ),
+        el('div', { id: 'loginForm', class: 'auth-form' },
+            el('label', {}, 'Login to your account'),
+            el('input', { id: 'loginUsername', placeholder: 'Username', autocomplete: 'username' }),
+            el('input', { id: 'loginPassword', type: 'password', placeholder: 'Password', autocomplete: 'current-password' }),
+            el('button', { id: 'loginBtn' }, 'Login')
+        ),
+        el('div', { id: 'registerForm', class: 'auth-form hidden' },
+            el('label', {}, 'Create a new account'),
+            el('input', { id: 'registerUsername', placeholder: 'Choose username', autocomplete: 'username' }),
+            el('input', { id: 'registerPassword', type: 'password', placeholder: 'Choose password', autocomplete: 'new-password' }),
+            el('button', { id: 'registerBtn' }, 'Register')
+        ),
+        el('div', { class: 'hint' }, 'Create an account or login to start chatting in real time.')
+    );
+
+    const messagesEl = el('div', { class: 'messages', id: 'messages' });
+    const composer = el('div', { class: 'composer hidden', id: 'composer' },
+        el('input', { id: 'messageInput', placeholder: 'Type a message and press Enter...' }),
+        el('button', { id: 'sendBtn' }, 'Send')
+    );
+
+    app.appendChild(style);
+    app.appendChild(header);
+    const container = el('div', { class: 'container' });
+    container.appendChild(loginView);
+    container.appendChild(messagesEl);
+    container.appendChild(composer);
+    app.appendChild(container);
+    document.body.appendChild(app);
+
+    // ---------- Helpers ----------
+    const setStatus = (text) => $('#status').textContent = text;
+
+    const fmtTime = (ts) => {
+        try {
+            const d = ts ? new Date(ts) : new Date();
+            return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        } catch {
+            return '';
+        }
+    };
+
+    const normalizeMessage = (raw) => {
+        // Attempt to normalize various shapes to { id, userName, message, timestamp }
+        const m = raw?.payload?.message ?? raw?.data?.message ?? raw?.message ?? raw?.payload ?? raw?.data ?? raw;
+        if (!m || (typeof m !== 'object' && typeof m !== 'string')) {
+            if (typeof raw === 'string') return { id: undefined, userName: 'unknown', message: raw, timestamp: Date.now() };
+            return null;
+        }
+        const obj = typeof m === 'string' ? { message: m } : m;
+        
+        // Map backend format {messageId, senderId, content, createdAt} to frontend format
+        return {
+            id: obj.id ?? obj.messageId ?? obj.pk ?? obj.sk ?? `${obj.senderId || obj.userName || obj.username || 'user'}-${obj.createdAt || obj.timestamp || Date.now()}-${Math.random().toString(36).slice(2)}`,
+            userName: obj.senderId ?? obj.userName ?? obj.username ?? obj.user ?? obj.author ?? 'unknown',
+            message: obj.content ?? obj.message ?? obj.text ?? obj.body ?? '',
+            timestamp: obj.createdAt ? new Date(obj.createdAt).getTime() : (obj.timestamp ?? Date.now()),
+        };
+    };
+
+    const renderMessage = (msg) => {
+        if (!msg) return;
+        if (!msg.id) msg.id = `${msg.userName}-${msg.timestamp}-${Math.random().toString(36).slice(2)}`;
+        if (state.messages.has(msg.id)) return; // de-dupe
+        state.messages.set(msg.id, msg);
+
+        const isMe = state.username && msg.userName && state.username.toLowerCase() === String(msg.userName).toLowerCase();
+
+        const bubble = el('div', { class: `bubble${isMe ? ' me' : ''}`, 'data-id': msg.id },
+            el('div', { class: 'meta' }, `${msg.userName || 'unknown'} • ${fmtTime(msg.timestamp)}`),
+            el('div', { class: 'text' }, msg.message || '')
+        );
+        messagesEl.appendChild(bubble);
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+    };
+
+    const renderInitialMessages = (list) => {
+        if (!Array.isArray(list)) return;
+        list
+            .map(normalizeMessage)
+            .filter(Boolean)
+            .sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0))
+            .forEach(renderMessage);
+    };
+
+    // ---------- Configuration ----------
+    // Use configuration from config.js, with fallback for backwards compatibility
+    const API_BASE_URL = (window.CHAT_CONFIG && window.CHAT_CONFIG.API_BASE_URL) 
+        ? window.CHAT_CONFIG.API_BASE_URL 
+        : 'https://lzypp0ol5j.execute-api.us-east-1.amazonaws.com';
+    
+    console.log('Using API Base URL:', API_BASE_URL);
+
+    // ---------- REST ----------
+    const postJSON = async (path, body, token) => {
+        const url = path.startsWith('http') ? path : `${API_BASE_URL}${path}`;
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify(body || {}),
+        });
+        if (!res.ok) {
+            const txt = await res.text().catch(() => '');
+            throw new Error(`HTTP ${res.status} ${res.statusText} ${txt}`);
+        }
+        // Try JSON, fallback to empty object
+        try { return await res.json(); } catch { return {}; }
+    };
+
+    // ---------- WebSocket ----------
+    const connectWS = () => {
+        if (!state.wsUrl || !state.token) {
+            console.warn('Missing wsUrl or token for WebSocket.');
+            setStatus('Missing WebSocket URL');
+            return;
+        }
+
+        const withQuery = (url, params) => {
+            const u = new URL(url);
+            Object.entries(params || {}).forEach(([k, v]) => v != null && u.searchParams.set(k, v));
+            return u.toString();
+        };
+
+        const url = withQuery(state.wsUrl, { token: state.token, username: state.username });
+
+        try {
+            state.ws = new WebSocket(url);
+        } catch (e) {
+            console.error('WebSocket init error:', e);
+            setTimeout(connectWS, Math.min(state.wsBackoffMs *= 2, state.wsMaxBackoffMs));
+            return;
+        }
+
+        state.ws.addEventListener('open', () => {
+            state.connected = true;
+            state.wsBackoffMs = 500;
+            setStatus('Connected');
+        });
+
+        state.ws.addEventListener('message', (ev) => {
+            let data = ev.data;
+            try { data = JSON.parse(ev.data); } catch { /* keep as string */ }
+            // Accept either single message or envelopes like { type: 'newMessage', payload: { message } } or { messages: [...] }
+            if (Array.isArray(data?.messages)) {
+                data.messages.map(normalizeMessage).filter(Boolean).forEach(renderMessage);
+            } else {
+                const msg = normalizeMessage(data);
+                if (msg) renderMessage(msg);
+            }
+        });
+
+        state.ws.addEventListener('close', () => {
+            state.connected = false;
+            setStatus('Disconnected - reconnecting...');
+            state.ws = null;
+            setTimeout(connectWS, Math.min(state.wsBackoffMs *= 2, state.wsMaxBackoffMs));
+        });
+
+        state.ws.addEventListener('error', (e) => {
+            console.error('WebSocket error:', e);
+            // Let close handler perform backoff/reconnect
+        });
+    };
+
+    // ---------- Tab switching ----------
+    const switchTab = (activeTab) => {
+        const loginTab = $('#loginTab');
+        const registerTab = $('#registerTab');
+        const loginForm = $('#loginForm');
+        const registerForm = $('#registerForm');
+
+        if (activeTab === 'login') {
+            loginTab.classList.add('active');
+            registerTab.classList.remove('active');
+            loginForm.classList.remove('hidden');
+            registerForm.classList.add('hidden');
+        } else {
+            registerTab.classList.add('active');
+            loginTab.classList.remove('active');
+            registerForm.classList.remove('hidden');
+            loginForm.classList.add('hidden');
+        }
+    };
+
+    // ---------- Actions ----------
+    const doRegister = async () => {
+        const username = $('#registerUsername').value.trim();
+        const password = $('#registerPassword').value;
+        const btn = $('#registerBtn');
+
+        if (!username || !password) {
+            alert('Please fill in all fields');
+            return;
+        }
+
+        if (password.length < 8) {
+            alert('Password must be at least 8 characters long');
+            return;
+        }
+
+        btn.disabled = true;
+        setStatus('Creating account...');
+
+        try {
+            const res = await postJSON('/register', {
+                username,
+                password
+            });
+
+            if (res.message || res.username) {
+                alert('Account created successfully! Please login.');
+                switchTab('login');
+                $('#loginUsername').value = username;
+            } else {
+                throw new Error(res.error || 'Registration failed');
+            }
+        } catch (err) {
+            console.error(err);
+            alert(`Registration failed: ${err.message}`);
+            setStatus('Registration failed');
+        } finally {
+            btn.disabled = false;
+        }
+    };
+
+    const doLogin = async () => {
+        const username = $('#loginUsername').value.trim();
+        const password = $('#loginPassword').value;
+        const btn = $('#loginBtn');
+
+        if (!username || !password) {
+            alert('Please enter username and password');
+            return;
+        }
+
+        btn.disabled = true;
+        setStatus('Logging in...');
+
+        try {
+            const res = await postJSON('/login', {
+                username,
+                password
+            });
+
+            if (res.token) {
+                state.username = username;
+                state.token = res.token;
+                state.wsUrl = res.wsUrl || res.websocketUrl || null;
+
+                // Update UI first
+                loginView.classList.add('hidden');
+                composer.classList.remove('hidden');
+                setStatus('Loading messages...');
+
+                // Fetch historical messages separately using GET with token in query
+                try {
+                    const messagesRes = await fetch(`${API_BASE_URL}/getStoredMessages?token=${encodeURIComponent(state.token)}`, {
+                        method: 'GET',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        }
+                    });
+                    
+                    if (!messagesRes.ok) {
+                        throw new Error(`HTTP ${messagesRes.status} ${messagesRes.statusText}`);
+                    }
+                    
+                    const data = await messagesRes.json();
+                    const initial = data.messages || [];
+                    renderInitialMessages(initial);
+                } catch (msgErr) {
+                    console.warn('Failed to load message history:', msgErr);
+                    // Continue without historical messages
+                }
+
+                // Connect to WebSocket for real-time messages
+                setStatus('Connecting...');
+                connectWS();
+
+                // Focus composer
+                setTimeout(() => $('#messageInput')?.focus(), 50);
+            } else {
+                throw new Error(res.error || 'No token received');
+            }
+        } catch (err) {
+            console.error(err);
+            alert(`Login failed: ${err.message}`);
+            setStatus('Login failed');
+        } finally {
+            btn.disabled = false;
+        }
+    };
+
+    const sendMessage = async () => {
+        const input = $('#messageInput');
+        const text = (input.value || '').trim();
+        if (!text || !state.token) return;
+
+        const body = {
+            senderId: state.username,
+            content: text,
+        };
+
+        try {
+            $('#sendBtn').disabled = true;
+            await postJSON('/addMessages', body, state.token);
+            input.value = '';
+            // Rely on WebSocket broadcast to render the new message
+        } catch (err) {
+            console.error(err);
+            alert('Send failed. Please try again.');
+        } finally {
+            $('#sendBtn').disabled = false;
+            input.focus();
+        }
+    };
+
+    // ---------- Wire events ----------
+    // Tab switching
+    $('#loginTab').addEventListener('click', () => switchTab('login'));
+    $('#registerTab').addEventListener('click', () => switchTab('register'));
+
+    // Authentication
+    $('#loginBtn').addEventListener('click', doLogin);
+    $('#registerBtn').addEventListener('click', doRegister);
+
+    // Enter key handlers
+    $('#loginUsername').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') $('#loginPassword').focus();
+    });
+    $('#loginPassword').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') doLogin();
+    });
+    $('#registerUsername').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') $('#registerPassword').focus();
+    });
+    $('#registerPassword').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') doRegister();
+    });
+
+    // Message sending
+    $('#sendBtn').addEventListener('click', sendMessage);
+    $('#messageInput').addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    });
+
+    // Initial status
+    setStatus('Disconnected');
+})();
